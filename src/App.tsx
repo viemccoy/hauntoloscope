@@ -1,0 +1,1172 @@
+import { useCallback, useMemo, useRef, useState, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import {
+  generateArticle,
+  generateInterpolations,
+  generateTimeline
+} from "./lib/groq";
+import { useLocalStorage } from "./hooks/useLocalStorage";
+import {
+  ArticleResponse,
+  HauntoloscopeBundle,
+  TimelineEntry,
+  TimelineResponse
+} from "./types";
+
+type ArticleState = {
+  status: "idle" | "loading" | "ready" | "error";
+  data?: ArticleResponse;
+  error?: string;
+};
+
+function formatError(error: unknown) {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+function parseAnchorDate(raw?: string) {
+  if (!raw) return null;
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed;
+}
+
+function formatDisplayDate(raw?: string) {
+  if (!raw) return "";
+  const parsed = parseAnchorDate(raw);
+  if (!parsed) return raw;
+  return parsed.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric"
+  });
+}
+
+function deriveTimelineBounds(entries: TimelineEntry[]) {
+  const dates = entries
+    .map((entry) => parseAnchorDate(entry.anchorDate))
+    .filter((value): value is Date => Boolean(value))
+    .sort((a, b) => a.getTime() - b.getTime());
+
+  if (dates.length === 0) {
+    return null;
+  }
+
+  return {
+    start: dates[0],
+    end: dates[dates.length - 1]
+  };
+}
+
+function formatBoundsRange(bounds: { start: Date; end: Date }) {
+  const formatter = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short" });
+  const startLabel = formatter.format(bounds.start);
+  const endLabel = formatter.format(bounds.end);
+  if (startLabel === endLabel) {
+    return startLabel;
+  }
+  return `${startLabel} → ${endLabel}`;
+}
+
+const GUIDING_PRINCIPLE_FILTERS = [
+  /counterfactual step institutionally and economically traceable/i,
+  /simulation fidelity/i,
+  /uncanny anomaly per entry/i,
+  /priority stack/i,
+  /respond with json only/i,
+  /score\s*≥/i,
+  /negating the/i,
+  /simulate/i,
+  /assume the/i,
+  /allowing only/i,
+  /^by\s+/i,
+  /minimum institutional/i
+];
+
+function sanitizeGuidingPrinciple(raw?: string | null) {
+  if (!raw) return null;
+  const segments = raw
+    .split(/\s*\n+\s*|(?<=[.?!])\s+/)
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .filter(
+      (segment) =>
+        !GUIDING_PRINCIPLE_FILTERS.some((pattern) =>
+          pattern.test(segment.toLowerCase())
+        )
+    )
+    .filter((segment) => segment.length > 8);
+  if (segments.length === 0) return null;
+  const joined = segments.join(" ");
+  if (/simulate|negating|score|priority|minimum institutional/i.test(joined)) {
+    return null;
+  }
+  return joined;
+}
+
+function createSeedSummary(seedEvent: string, timeline: TimelineResponse) {
+  const normalizedSeed = seedEvent.trim().replace(/\s+/g, " ");
+  const base = normalizedSeed || "Unspecified Counterfactual";
+  const headline = timeline.timeline_title?.trim() ?? "";
+  const firstEntry = timeline.entries[0];
+  const anchor = firstEntry?.anchorDate || firstEntry?.era || "";
+  const parts = [base, headline, anchor].filter(Boolean);
+  return parts.join(" • ").toUpperCase();
+}
+
+const ARTICLE_MARKDOWN_COMPONENTS: Components = {
+  h2: ({ node, ...props }) => (
+    <h3
+      style={{
+        fontSize: "1.6rem",
+        letterSpacing: "0.05em",
+        textTransform: "uppercase",
+        margin: "1.5rem 0 0.75rem"
+      }}
+      {...props}
+    />
+  ),
+  h3: ({ node, ...props }) => (
+    <h4
+      style={{
+        fontSize: "1.3rem",
+        letterSpacing: "0.04em",
+        textTransform: "uppercase",
+        margin: "1.2rem 0 0.6rem"
+      }}
+      {...props}
+    />
+  ),
+  p: ({ node, ...props }) => (
+    <p
+      style={{
+        margin: "0 0 1rem",
+        lineHeight: 1.7,
+        opacity: 0.95
+      }}
+      {...props}
+    />
+  ),
+  strong: ({ node, ...props }) => (
+    <strong
+      style={{
+        fontWeight: 600,
+        letterSpacing: "0.02em"
+      }}
+      {...props}
+    />
+  ),
+  em: ({ node, ...props }) => (
+    <em
+      style={{
+        fontStyle: "italic"
+      }}
+      {...props}
+    />
+  ),
+  ul: ({ node, ...props }) => (
+    <ul
+      style={{
+        paddingLeft: "1.5rem",
+        margin: "0 0 1rem",
+        lineHeight: 1.6
+      }}
+      {...props}
+    />
+  ),
+  ol: ({ node, ...props }) => (
+    <ol
+      style={{
+        paddingLeft: "1.5rem",
+        margin: "0 0 1rem",
+        lineHeight: 1.6
+      }}
+      {...props}
+    />
+  ),
+  li: ({ node, ...props }) => (
+    <li
+      style={{
+        marginBottom: "0.35rem"
+      }}
+      {...props}
+    />
+  ),
+  blockquote: ({ node, ...props }) => (
+    <blockquote
+      style={{
+        borderLeft: "3px solid rgba(245,241,230,0.25)",
+        margin: "1.5rem 0",
+        padding: "0.75rem 1rem",
+        fontStyle: "italic",
+        background: "rgba(50, 40, 70, 0.25)"
+      }}
+      {...props}
+    />
+  )
+};
+
+const LEDE_MARKDOWN_COMPONENTS: Components = {
+  ...ARTICLE_MARKDOWN_COMPONENTS,
+  p: ({ node, ...props }) => (
+    <p
+      style={{
+        margin: "0 0 1rem",
+        lineHeight: 1.7,
+        fontWeight: 600,
+        fontSize: "1.05rem",
+        letterSpacing: "0.01em"
+      }}
+      {...props}
+    />
+  )
+};
+
+export default function App() {
+  const [apiKey, setApiKey] = useLocalStorage<string>("hauntoloscope.apiKey", "");
+  const [seedEvent, setSeedEvent] = useState("");
+  const [timeline, setTimeline] = useState<TimelineResponse | null>(null);
+  const [articles, setArticles] = useState<Record<string, ArticleState>>({});
+  const [seedSummary, setSeedSummary] = useState<string>("");
+  const [interpolationStatus, setInterpolationStatus] = useState<Record<string, "idle" | "loading">>({});
+  const [interpolationErrors, setInterpolationErrors] = useState<Record<string, string | null>>({});
+  const [activeEntryId, setActiveEntryId] = useState<string | null>(null);
+  const [isGeneratingTimeline, setIsGeneratingTimeline] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const mainContentRef = useRef<HTMLDivElement | null>(null);
+
+  const handleGenerateTimeline = useCallback(async () => {
+    if (!apiKey) {
+      setError("Provide your Groq API key first.");
+      return;
+    }
+    if (!seedEvent.trim()) {
+      setError("Whisper an event from the past before invoking the scope.");
+      return;
+    }
+
+    try {
+      setError(null);
+      setIsGeneratingTimeline(true);
+      setActiveEntryId(null);
+      setArticles({});
+      setInterpolationStatus({});
+      setInterpolationErrors({});
+      const response = await generateTimeline(apiKey, seedEvent.trim());
+      setTimeline(response);
+      setSeedSummary(createSeedSummary(seedEvent, response));
+    } catch (err) {
+      setError(formatError(err));
+    } finally {
+      setIsGeneratingTimeline(false);
+    }
+  }, [apiKey, seedEvent]);
+
+  const handleSelectEntry = useCallback(
+    async (entry: TimelineEntry) => {
+      setActiveEntryId(entry.id);
+      if (!apiKey || !timeline) {
+        return;
+      }
+      const current = articles[entry.id];
+      if (current?.status === "loading" || current?.status === "ready") {
+        return;
+      }
+
+      setArticles((prev) => ({
+        ...prev,
+        [entry.id]: { status: "loading" }
+      }));
+
+      try {
+        const article = await generateArticle(apiKey, seedEvent, entry, timeline);
+        setArticles((prev) => ({
+          ...prev,
+          [entry.id]: { status: "ready", data: article }
+        }));
+      } catch (err) {
+        setArticles((prev) => ({
+          ...prev,
+          [entry.id]: { status: "error", error: formatError(err) }
+        }));
+      }
+    },
+    [apiKey, articles, seedEvent, timeline]
+  );
+
+  const handleInterpolations = useCallback(
+    async (entry: TimelineEntry) => {
+      if (!timeline || !apiKey) return;
+      setInterpolationErrors((prev) => ({ ...prev, [entry.id]: null }));
+      setInterpolationStatus((prev) => ({ ...prev, [entry.id]: "loading" }));
+      const entries = timeline.entries;
+      const index = entries.findIndex((item) => item.id === entry.id);
+      const previous = index > 0 ? entries[index - 1] : undefined;
+      const next = index >= 0 && index < entries.length - 1 ? entries[index + 1] : undefined;
+
+      try {
+        const { entries: additions } = await generateInterpolations(apiKey, seedEvent, {
+          previous,
+          current: entry,
+          next,
+          timeline
+        });
+
+        if (!additions?.length) return;
+
+        const newEntries = [...entries];
+        const insertIndex = index >= 0 ? index + 1 : newEntries.length;
+
+        additions.forEach((addition, offset) => {
+          if (newEntries.some((existing) => existing.id === addition.id)) {
+            return;
+          }
+          newEntries.splice(insertIndex + offset, 0, addition);
+        });
+
+        setTimeline({ ...timeline, entries: newEntries });
+      } catch (err) {
+        const message = formatError(err);
+        setInterpolationErrors((prev) => ({ ...prev, [entry.id]: message }));
+        setError(message);
+      } finally {
+        setInterpolationStatus((prev) => ({ ...prev, [entry.id]: "idle" }));
+      }
+    },
+    [apiKey, seedEvent, timeline]
+  );
+
+  const handleExport = useCallback(() => {
+    if (!timeline) return;
+    const bundle: HauntoloscopeBundle = {
+      seed_event: seedEvent,
+      seed_summary: seedSummary,
+      generated_at: new Date().toISOString(),
+      timeline,
+      articles: Object.fromEntries(
+        Object.entries(articles)
+          .filter(([, value]) => value.status === "ready" && value.data)
+          .map(([key, value]) => [key, value.data as ArticleResponse])
+      )
+    };
+
+    const blob = new Blob([JSON.stringify(bundle, null, 2)], {
+      type: "application/json"
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `hauntoloscope-${Date.now()}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }, [articles, seedEvent, timeline]);
+
+  const handleImport = useCallback(async (file: File) => {
+    try {
+      const text = await file.text();
+      const bundle = JSON.parse(text) as HauntoloscopeBundle;
+      setSeedEvent(bundle.seed_event);
+      setTimeline(bundle.timeline);
+      setArticles(
+        Object.fromEntries(
+          Object.entries(bundle.articles || {}).map(([key, value]) => [
+            key,
+            { status: "ready", data: value }
+          ])
+        )
+      );
+      if (bundle.seed_summary) {
+        setSeedSummary(bundle.seed_summary);
+      } else {
+        setSeedSummary(createSeedSummary(bundle.seed_event, bundle.timeline));
+      }
+      setInterpolationStatus({});
+      setInterpolationErrors({});
+      setActiveEntryId(null);
+      setError(null);
+    } catch (err) {
+      setError(`Failed to import bundle: ${formatError(err)}`);
+    }
+  }, []);
+
+  const timelineEntries = useMemo(() => timeline?.entries ?? [], [timeline]);
+  const threadsCatalogue = useMemo(() => {
+    const registry = new Set<string>();
+    timelineEntries.forEach((entry) =>
+      entry.threads?.forEach((thread) => registry.add(thread))
+    );
+    return Array.from(registry);
+  }, [timelineEntries]);
+  const timelineBounds = useMemo(
+    () => (timelineEntries.length ? deriveTimelineBounds(timelineEntries) : null),
+    [timelineEntries]
+  );
+  const guidingPrinciple = useMemo(() => {
+    if (!timeline) return null;
+    const cleaned = sanitizeGuidingPrinciple(timeline.guiding_principle);
+    if (cleaned) return cleaned;
+    const firstSummary = timeline.entries?.[0]?.summary?.trim();
+    return firstSummary || null;
+  }, [timeline]);
+
+  useEffect(() => {
+    if (mainContentRef.current) {
+      mainContentRef.current.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  }, [activeEntryId, timeline]);
+
+  const activeEntry = useMemo(() => {
+    if (!timeline) return null;
+    return (
+      timeline.entries.find((item) => item.id === activeEntryId) ??
+      timeline.entries[0] ??
+      null
+    );
+  }, [timeline, activeEntryId]);
+
+  const activeArticleState = activeEntryId ? articles[activeEntryId] : undefined;
+
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "420px 1fr",
+        minHeight: "100vh",
+        backdropFilter: "blur(8px)",
+        backgroundColor: "rgba(5, 5, 9, 0.92)"
+      }}
+    >
+      <aside
+        style={{
+          borderRight: "1px solid rgba(245,241,230,0.1)",
+          padding: "2rem 1.75rem",
+          overflowY: "auto",
+          height: "100vh"
+        }}
+      >
+        <header style={{ marginBottom: "2rem" }}>
+          <h1 style={{ fontSize: "2.5rem", textTransform: "uppercase" }}>HAUNTOLOSCOPE</h1>
+          <div
+            style={{
+              marginTop: "1rem",
+              fontSize: "0.85rem",
+              lineHeight: 1.6,
+              opacity: 0.8,
+              maxWidth: "24rem"
+            }}
+          >
+            <div>
+              <strong style={{ letterSpacing: "0.08em" }}>hauntology (noun):</strong> the study of
+              how unresolved pasts linger within the present, refusing to fully vanish even as new
+              futures emerge.
+            </div>
+            <div style={{ marginTop: "0.6rem" }}>
+              <strong style={{ letterSpacing: "0.08em" }}>hauntoloscope (noun):</strong> an instrument
+              for surveying counterfactual echoes—mapping the institutional, cultural, and human
+              ripples that radiate from a single altered event.
+            </div>
+          </div>
+        </header>
+
+        <section style={{ marginBottom: "2rem" }}>
+          <label
+            htmlFor="apiKey"
+            style={{ display: "block", fontSize: "0.85rem", letterSpacing: "0.08em", opacity: 0.8 }}
+          >
+            Groq API Key
+          </label>
+          <input
+            id="apiKey"
+            type="password"
+            placeholder="gsk_..."
+            value={apiKey}
+            onChange={(event) => setApiKey(event.target.value)}
+            autoComplete="off"
+            style={{ marginTop: "0.5rem" }}
+          />
+        </section>
+
+        <section style={{ marginBottom: "1.5rem" }}>
+          <label
+            htmlFor="seedEvent"
+            style={{ display: "block", fontSize: "0.85rem", letterSpacing: "0.08em", opacity: 0.8 }}
+          >
+            Seed Event
+          </label>
+          <textarea
+            id="seedEvent"
+            rows={5}
+            value={seedEvent}
+            onChange={(event) => setSeedEvent(event.target.value)}
+            onKeyDown={(event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                event.preventDefault();
+                handleGenerateTimeline();
+              }
+            }}
+            placeholder="Describe the moment you wish to disturb..."
+            style={{ marginTop: "0.5rem", resize: "vertical" }}
+          />
+          <button
+            onClick={handleGenerateTimeline}
+            style={{
+              marginTop: "0.75rem",
+              width: "100%",
+              padding: "0.75rem",
+              fontFamily: "'Cormorant Garamond', 'Spectral', serif",
+              letterSpacing: "0.12em",
+              fontSize: "1.1rem",
+              textTransform: "uppercase"
+            }}
+            disabled={isGeneratingTimeline}
+          >
+            {isGeneratingTimeline ? "Scrying..." : "Bend the Axis"}
+          </button>
+        </section>
+
+        {error && (
+          <div
+            role="alert"
+            style={{
+              border: "1px solid rgba(220,90,90,0.6)",
+              padding: "0.75rem",
+              background: "rgba(60,10,10,0.35)",
+              color: "#f7dede",
+              fontSize: "0.9rem",
+              marginBottom: "1.5rem"
+            }}
+          >
+            {error}
+          </div>
+        )}
+
+        <section style={{ marginBottom: "1.5rem" }}>
+          <div
+            style={{
+              display: "flex",
+              gap: "0.75rem",
+              marginBottom: "0.5rem",
+              justifyContent: "center",
+              flexWrap: "wrap"
+            }}
+          >
+            <button onClick={handleExport} disabled={!timeline} style={{ borderWidth: "2px" }}>
+              Export Relic
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              style={{ borderWidth: "2px" }}
+            >
+              Import Relic
+            </button>
+          </div>
+          <input
+            type="file"
+            accept="application/json"
+            ref={fileInputRef}
+            style={{ display: "none" }}
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) handleImport(file);
+              event.target.value = "";
+            }}
+          />
+        </section>
+
+        <section>
+          <h2
+            style={{
+              fontSize: "1.2rem",
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
+              marginBottom: "0.5rem"
+            }}
+          >
+            Timeline Desk
+          </h2>
+          {timelineEntries.length === 0 ? (
+            <div style={{ opacity: 0.6 }}>No echoes inscribed yet.</div>
+          ) : (
+            <>
+              <div
+                style={{
+                  border: "1px solid rgba(245,241,230,0.15)",
+                  padding: "1rem",
+                  background: "rgba(10, 10, 14, 0.62)",
+                  marginBottom: "1rem",
+                  display: "grid",
+                  gap: "0.75rem"
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: "0.75rem",
+                    letterSpacing: "0.12em",
+                    textTransform: "uppercase",
+                    opacity: 0.7
+                  }}
+                >
+                  Desk Briefing
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: "0.5rem",
+                    justifyContent: "space-between",
+                    fontSize: "0.95rem",
+                    opacity: 0.85
+                  }}
+                >
+                  <span>
+                    {timelineEntries.length} recorded{" "}
+                    {timelineEntries.length === 1 ? "event" : "events"}
+                  </span>
+                  {timelineBounds ? <span>Span {formatBoundsRange(timelineBounds)}</span> : null}
+                </div>
+                {threadsCatalogue.length > 0 && (
+                  <div>
+                    <div
+                      style={{
+                        fontSize: "0.75rem",
+                        letterSpacing: "0.12em",
+                        textTransform: "uppercase",
+                        opacity: 0.7,
+                        marginBottom: "0.35rem"
+                      }}
+                    >
+                      Threads
+                    </div>
+                    <div
+                      style={{
+                        display: "flex",
+                        flexWrap: "wrap",
+                        gap: "0.35rem"
+                      }}
+                    >
+                      {threadsCatalogue.map((thread) => (
+                        <span
+                          key={thread}
+                          style={{
+                            border: "1px solid rgba(245,241,230,0.2)",
+                            padding: "0.2rem 0.45rem",
+                            fontSize: "0.7rem",
+                            letterSpacing: "0.08em"
+                          }}
+                        >
+                          {thread}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+              <ol
+                style={{
+                  listStyle: "none",
+                  padding: 0,
+                  margin: 0,
+                  display: "grid",
+                  gap: "1.25rem"
+                }}
+              >
+                {timelineEntries.map((entry, index) => {
+                  const isActive = entry.id === activeEntryId;
+                  const articleState = articles[entry.id];
+                  const displayDate = formatDisplayDate(entry.anchorDate);
+                  const ordinal = String(index + 1).padStart(2, "0");
+                  const isInterpolating = interpolationStatus[entry.id] === "loading";
+                  const interpolationError = interpolationErrors[entry.id] ?? null;
+
+                  let statusLabel = "Awaiting inscription";
+                  let statusColor = "rgba(245,241,230,0.6)";
+                  if (isInterpolating) {
+                    statusLabel = "Extending interval…";
+                    statusColor = "rgba(190,150,255,0.85)";
+                  } else if (articleState?.status === "loading") {
+                    statusLabel = "Scribing in progress…";
+                    statusColor = "rgba(190,150,255,0.85)";
+                  } else if (articleState?.status === "ready") {
+                    statusLabel = "Broadsheet archived";
+                    statusColor = "rgba(170,220,200,0.9)";
+                  }
+
+                  if (articleState?.status === "error") {
+                    statusLabel = "Scribing failed — retry";
+                    statusColor = "rgba(255,160,160,0.9)";
+                  }
+                  if (interpolationError) {
+                    statusLabel = "Interval expansion failed — retry";
+                    statusColor = "rgba(255,160,160,0.9)";
+                  }
+
+                  const openButtonLabel =
+                    articleState?.status === "ready" ? "Open Chronicle" : "Summon Chronicle";
+                  const generateButtonLabel = isInterpolating ? "Weaving…" : "Generate More Events";
+
+                  return (
+                    <li key={entry.id} style={{ listStyle: "none" }}>
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "minmax(56px, 68px) 1fr",
+                          alignItems: "stretch",
+                          gap: "1rem"
+                        }}
+                      >
+                        <div
+                          style={{
+                            position: "relative",
+                            display: "flex",
+                            flexDirection: "column",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            padding: "1.4rem 0",
+                            textTransform: "uppercase",
+                            letterSpacing: "0.12em",
+                            fontSize: "0.6rem",
+                            color: "rgba(245,241,230,0.68)"
+                          }}
+                        >
+                          <div
+                            style={{
+                              position: "absolute",
+                              top: "0.4rem",
+                              bottom: "0.4rem",
+                              width: "1px",
+                              background:
+                                "linear-gradient(180deg, rgba(245,241,230,0), rgba(245,241,230,0.45), rgba(245,241,230,0))",
+                              left: "50%",
+                              transform: "translateX(-50%)"
+                            }}
+                          />
+                          <span
+                            style={{
+                              background: "rgba(10,10,14,0.85)",
+                              padding: "0 0.4rem",
+                              zIndex: 1
+                            }}
+                          >
+                            Interval
+                          </span>
+                          <span
+                            style={{
+                              fontFamily: "monospace",
+                              fontSize: "0.85rem",
+                              letterSpacing: "0.04em",
+                              textTransform: "none",
+                              background: "rgba(10,10,14,0.9)",
+                              padding: "0.25rem 0.6rem",
+                              borderRadius: "999px",
+                              border: "1px solid rgba(245,241,230,0.25)",
+                              color: "rgba(245,241,230,0.85)",
+                              zIndex: 1
+                            }}
+                          >
+                            #{ordinal}
+                          </span>
+                          <span
+                            style={{
+                              width: "8px",
+                              height: "8px",
+                              borderRadius: "50%",
+                              background: isActive
+                                ? "rgba(190,150,255,0.9)"
+                                : "rgba(245,241,230,0.75)",
+                              boxShadow: isActive
+                                ? "0 0 8px rgba(190,150,255,0.7)"
+                                : "0 0 6px rgba(245,241,230,0.35)",
+                              zIndex: 1
+                            }}
+                          />
+                        </div>
+                        <div
+                          style={{
+                            border: `1px solid ${
+                              isActive ? "rgba(190,150,255,0.7)" : "rgba(245,241,230,0.2)"
+                            }`,
+                            background: isActive ? "rgba(40, 15, 60, 0.5)" : "rgba(10, 10, 14, 0.55)",
+                            padding: "1.2rem 1.4rem",
+                            display: "grid",
+                            gap: "0.85rem",
+                            transition: "border-color 0.2s ease"
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              alignItems: "flex-start",
+                              flexWrap: "wrap",
+                              gap: "0.5rem"
+                            }}
+                          >
+                            <div
+                              style={{
+                                display: "flex",
+                                flexWrap: "wrap",
+                                gap: "0.5rem",
+                                fontSize: "0.85rem",
+                                letterSpacing: "0.08em",
+                                opacity: 0.75,
+                                textTransform: "uppercase"
+                              }}
+                            >
+                              <span>{entry.era || "Untethered era"}</span>
+                              {displayDate && <span>{displayDate}</span>}
+                            </div>
+                          </div>
+                          <div style={{ fontSize: "1.1rem", fontWeight: 600 }}>{entry.title}</div>
+                          <p style={{ margin: 0, lineHeight: 1.6, opacity: 0.9 }}>{entry.summary}</p>
+                          {entry.threads && entry.threads.length > 0 && (
+                            <div
+                              style={{
+                                display: "flex",
+                                flexWrap: "wrap",
+                                gap: "0.35rem"
+                              }}
+                            >
+                              {entry.threads.map((thread) => (
+                                <span
+                                  key={thread}
+                                  style={{
+                                    border: "1px solid rgba(245,241,230,0.2)",
+                                    padding: "0.2rem 0.45rem",
+                                    fontSize: "0.7rem",
+                                    letterSpacing: "0.08em"
+                                  }}
+                                >
+                                  {thread}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          <div
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              alignItems: "center",
+                              flexWrap: "wrap",
+                              gap: "0.75rem"
+                            }}
+                          >
+                            <span style={{ fontSize: "0.85rem", color: statusColor }}>
+                              {statusLabel}
+                            </span>
+                            <div
+                              style={{
+                                display: "flex",
+                                gap: "0.65rem",
+                                flexWrap: "wrap",
+                                justifyContent: "flex-end"
+                              }}
+                            >
+                              <button
+                                onClick={() => handleInterpolations(entry)}
+                                disabled={isInterpolating}
+                                style={{
+                                  borderWidth: "2px",
+                                  padding: "0.65rem 1.2rem",
+                                  minWidth: "12rem",
+                                  justifyContent: "center"
+                                }}
+                                className="generate-more-events"
+                              >
+                                {generateButtonLabel}
+                              </button>
+                              <button
+                                onClick={() => handleSelectEntry(entry)}
+                                disabled={articleState?.status === "loading"}
+                                style={{
+                                  borderWidth: "2px",
+                                  padding: "0.65rem 1.2rem",
+                                  minWidth: "12rem",
+                                  justifyContent: "center"
+                                }}
+                                className="primary-action"
+                              >
+                                {openButtonLabel}
+                              </button>
+                            </div>
+                          </div>
+                          {interpolationError && (
+                            <div
+                              style={{
+                                border: "1px solid rgba(255,160,160,0.4)",
+                                padding: "0.5rem 0.75rem",
+                                fontSize: "0.8rem",
+                                color: "rgba(255,200,200,0.9)",
+                                background: "rgba(60,10,10,0.35)"
+                              }}
+                            >
+                              {interpolationError}
+                            </div>
+                          )}
+                          {articleState?.status === "error" && articleState.error && (
+                            <div
+                              style={{
+                                border: "1px solid rgba(255,160,160,0.4)",
+                                padding: "0.5rem 0.75rem",
+                                fontSize: "0.8rem",
+                                color: "rgba(255,200,200,0.9)",
+                                background: "rgba(60,10,10,0.35)"
+                              }}
+                            >
+                              {articleState.error}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ol>
+            </>
+          )}
+        </section>
+      </aside>
+
+      <main
+        ref={mainContentRef}
+        style={{
+          padding: "2rem 3rem",
+          overflowY: "auto",
+          height: "100vh"
+        }}
+      >
+        <div
+          style={{
+            width: "min(100%, 900px)",
+            display: "flex",
+            flexDirection: "column",
+            gap: "2.5rem",
+            alignItems: "flex-start"
+          }}
+        >
+          <section
+            style={{
+              width: "100%",
+              padding: "1.8rem 2rem",
+              position: "relative",
+              overflow: "hidden",
+              background:
+                "radial-gradient(circle at top, rgba(190,150,255,0.18), transparent 60%), rgba(10,10,14,0.5)",
+              borderLeft: "3px solid rgba(190,150,255,0.35)",
+              boxShadow: "0 0 35px rgba(40, 20, 70, 0.35)",
+              display: "grid",
+              gap: "1.1rem"
+            }}
+          >
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                pointerEvents: "none",
+                background:
+                  "repeating-linear-gradient(45deg, rgba(245,241,230,0.04), rgba(245,241,230,0.04) 2px, transparent 2px, transparent 6px)"
+              }}
+            />
+            <div style={{ position: "relative", zIndex: 1 }}>
+              <h2
+                style={{
+                  fontSize: timeline ? "1.6rem" : "1.4rem",
+                  letterSpacing: "0.12em",
+                  textTransform: "uppercase",
+                  margin: 0,
+                  opacity: 0.85
+                }}
+              >
+                {timeline ? `Dossier: ${timeline.timeline_title}` : "Continuity Orientation Memo"}
+              </h2>
+              <p style={{ marginTop: "0.9rem", maxWidth: "60ch", lineHeight: 1.8, opacity: 0.92 }}>
+                {timeline
+                  ? guidingPrinciple ||
+                    "A chronology presented by the counterfactual bureau with all institutional records cross-referenced for consistency."
+                  : "HAUNTOLOSCOPE assembles documentary traces from timelines that never quite were. Submit an event that happened to see what unfolds if it never did—or describe the turning point you wish existed and watch the bureau trace its consequences."}
+              </p>
+            </div>
+            {timeline && (
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: "1.2rem",
+                  letterSpacing: "0.05em",
+                  fontSize: "0.85rem",
+                  textTransform: "uppercase",
+                  position: "relative",
+                  zIndex: 1
+                }}
+              >
+                <span style={{ opacity: 0.75 }}>
+                  Entries: {timelineEntries.length}
+                </span>
+                {timelineBounds && (
+                  <span style={{ opacity: 0.75 }}>Span: {formatBoundsRange(timelineBounds)}</span>
+                )}
+                {seedSummary && <span style={{ opacity: 0.75 }}>Inversion of: {seedSummary}</span>}
+              </div>
+            )}
+          </section>
+
+          {timeline && activeEntry && (
+            <ArticlePanel
+              seedSummary={seedSummary}
+              entry={activeEntry}
+              articleState={activeArticleState}
+            />
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+type ArticlePanelProps = {
+  seedSummary: string;
+  entry: TimelineEntry;
+  articleState?: ArticleState;
+};
+
+function ArticlePanel({ entry, articleState, seedSummary }: ArticlePanelProps) {
+  if (!articleState || articleState.status === "idle") {
+    return (
+      <section style={{ opacity: 0.6 }}>
+        Select an entry to conjure its broadsheet narrative.
+      </section>
+    );
+  }
+
+  if (articleState.status === "loading") {
+    return (
+      <section style={{ fontSize: "1.1rem", letterSpacing: "0.06em" }}>
+        Filing the story for <strong>{entry.title}</strong>…
+      </section>
+    );
+  }
+
+  if (articleState.status === "error") {
+    return (
+      <section
+        style={{
+          border: "1px solid rgba(220,90,90,0.6)",
+          padding: "1.5rem",
+          background: "rgba(60,10,10,0.35)",
+          color: "#f7dede",
+          maxWidth: "52rem"
+        }}
+      >
+        Failed to inscribe article: {articleState.error}
+      </section>
+    );
+  }
+
+  const article = articleState.data;
+  if (!article) return null;
+
+  const seededByText = seedSummary.trim() ? seedSummary.trim() : "UNSPECIFIED";
+
+  return (
+    <article
+      className="ledger-article"
+      style={{
+        border: "1px solid rgba(245,241,230,0.15)",
+      padding: "2rem",
+      background: "rgba(10, 10, 14, 0.65)",
+      maxWidth: "60rem",
+      display: "grid",
+      gap: "1.25rem",
+      lineHeight: 1.7
+    }}
+  >
+      <header style={{ marginBottom: "1.5rem" }}>
+        <div
+          style={{
+            fontSize: "0.9rem",
+            letterSpacing: "0.1em",
+            textTransform: "uppercase",
+            opacity: 0.75
+          }}
+        >
+          Filed by the HAUNTOLOSCOPE Counterfactual Bureau
+        </div>
+        <div
+          style={{
+            fontSize: "0.85rem",
+            letterSpacing: "0.08em",
+            opacity: 0.7,
+            marginTop: "0.35rem",
+            textTransform: "uppercase"
+          }}
+        >
+          Seeded by: {seededByText}
+        </div>
+        <h3 className="article-headline" style={{ margin: "0.85rem 0", fontSize: "1.8rem" }}>
+          {article.headline}
+        </h3>
+        <div style={{ fontFamily: "monospace", opacity: 0.7 }}>{article.dateline}</div>
+      </header>
+
+      <ReactMarkdown
+        className="ledger-markdown lede"
+        remarkPlugins={[remarkGfm]}
+        components={LEDE_MARKDOWN_COMPONENTS}
+      >
+        {article.lede}
+      </ReactMarkdown>
+
+      {article.body.map((segment, index) => (
+        <ReactMarkdown
+          key={index}
+          className="ledger-markdown"
+          remarkPlugins={[remarkGfm]}
+          components={ARTICLE_MARKDOWN_COMPONENTS}
+        >
+          {segment}
+        </ReactMarkdown>
+      ))}
+
+      {article.pull_quote && (
+        <blockquote
+          style={{
+            margin: "2rem 0",
+            padding: "1.5rem",
+            border: "1px dashed rgba(245,241,230,0.25)",
+            fontSize: "1.2rem",
+            fontStyle: "italic"
+          }}
+        >
+          “{article.pull_quote}”
+        </blockquote>
+      )}
+
+      {article.sidebar && article.sidebar.items.length > 0 && (
+        <aside
+          style={{
+            borderTop: "1px solid rgba(245,241,230,0.15)",
+            paddingTop: "1rem",
+            marginTop: "1.5rem"
+          }}
+        >
+          <h4 style={{ textTransform: "uppercase", letterSpacing: "0.08em" }}>
+            {article.sidebar.title}
+          </h4>
+          <ul style={{ marginTop: "0.75rem", paddingLeft: "1.25rem" }}>
+            {article.sidebar.items.map((item, index) => (
+              <li key={index} style={{ marginBottom: "0.5rem" }}>
+                {item}
+              </li>
+            ))}
+          </ul>
+        </aside>
+      )}
+    </article>
+  );
+}
