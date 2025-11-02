@@ -1,6 +1,11 @@
 ## HAUNTOLOSCOPE
 
-An esoteric counterfactual chronicle generator that communes with Groq's `moonshotai/kimi-k2-instruct-0905` model. Give it a historical hinge-point, receive a haunted alternate timeline and richly formatted broadsheet articles for each event.
+HAUNTOLOSCOPE is a counterfactual newsroom: give it an event and it divines a coherent alternate timeline, complete with diegetic broadsheet coverage. The app leans on Groq's `moonshotai/kimi-k2-instruct-0905` model and enforces a realism-first brief—no invented ministries, no out-of-world narration.
+
+The scope handles two kinds of seeds:
+
+- **Actual history**: Supply an event that really happened and HAUNTOLOSCOPE generates a world where it did **not** occur.
+- **Speculative history**: Supply an event that never happened (or a negated description) and it traces the world where it **does** occur.
 
 ### Getting Started
 
@@ -11,16 +16,19 @@ An esoteric counterfactual chronicle generator that communes with Groq's `moonsh
    npm run dev
    ```
 
-2. Open the app (default http://localhost:5173) and paste your Groq API key into the **Groq API Key** field. The key persists in `localStorage` so you only need to enter it once per browser.
+2. Open the app (default http://localhost:5173) and paste your Groq API key into the **Groq API Key** field. The key persists in `localStorage` so you only need to enter it once per browser session.
 
-3. Describe the seed event you wish to disturb and press **Bend the Axis**. Use the **Summon Chronicle** button on any timeline entry to conjure its broadsheet, or tap the ASCII eye glyph beside an entry to weave fresh events between anchors.
+3. Describe the seed event and press **Bend the Axis**. Use **Summon Chronicle** on any timeline entry to commission a newspaper article, or **Generate More Events** to interpolate additional anchors.
 
-### Export & Import
+### Import / Export
 
-- **Export Chronicle**: downloads a bundle with the seed event, the generated timeline, and every article you have already conjured.
-- **Import Relic**: loads a previously exported bundle to continue expanding the same counterfactual world.
+- **Export Relic**: downloads a bundle containing the original seed, the generated timeline, and any completed articles so far—perfect for archiving or collaboration.
+- **Import Relic**: restores a previously exported bundle, letting you continue enriching the same counterfactual universe.
 
-### Safety
+### Safety & Deployment Notes
 
-- The app communicates directly with Groq from the browser. Never hard-code your API key into the project; keep it in the secure field in the UI or use an environment-backed proxy if deploying publicly.
-- Responses are parsed as JSON—if the model deviates from the expected schema, the UI will surface the error so you can retry.
+- The app talks directly to Groq from the browser. Store your API key only in the provided password field or proxy the requests if deploying publicly.
+- All responses are parsed as JSON. When the model returns invalid JSON, the UI surfaces the failure so you can retry.
+- Build output lives in `dist/`. Deploy anywhere that serves static assets (Vercel, Cloudflare Pages, Netlify, etc.).
+
+Enjoy the bureau.
