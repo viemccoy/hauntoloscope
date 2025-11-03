@@ -469,8 +469,8 @@ export default function App() {
             </div>
             <div style={{ marginTop: "0.6rem" }}>
               <strong style={{ letterSpacing: "0.08em" }}>hauntoloscope (noun):</strong> an instrument
-              for surveying counterfactual echoes—mapping the institutional, cultural, and human
-              ripples that radiate from a single altered event.
+              for surveying counterfactual timelines, mapping the downstream headlines from a single
+              altered event.
             </div>
           </div>
         </header>
